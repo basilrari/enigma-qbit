@@ -1,5 +1,7 @@
 # Enigma Solve — HQP Solver for the Enigma 500-bit Prize Circuit
 
+> https://github.com/basilrari/enigma-solve
+
 A single self-contained program that reads a circuit QASM file and prints the
 exact peaked-state answer: an MPS (matrix product state) build of the circuit
 followed by an **exact-probability hill-climb** over the answer space, using a
