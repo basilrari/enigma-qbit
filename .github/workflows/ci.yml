@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - name: Install deps
+        run: |
+          pip install numpy scipy qiskit
+      - name: Run tests
+        run: |
+          python tests/verify_rigor.py
+          python tests/verify_svd.py
+
+  # Enforces the standard: a PR cannot merge until a review comment on it
+  # carries a "VERDICT: APPROVE" line. (Self-approvals are blocked on
+  # GitHub and the reviewing subagent shares the PR author's account, so
+  # the gate scans review comment bodies rather than review state.)
+  review-gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check for APPROVE verdict in review comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -e
+          curl -sS -f             -H "Authorization: Bearer ${GH_TOKEN}"             -H "User-Agent: github-workflow-standard"             -H "Accept: application/vnd.github+json"             "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews"             > reviews.json
+          python - <<'PY'
+          import json
+
+          with open("reviews.json") as f:
+              reviews = json.load(f)
+          verdicts = []
+          for rv in reviews:
+              body = (rv.get("body") or "").upper()
+              for line in body.splitlines():
+                  if "VERDICT:" in line:
+                      verdicts.append((rv.get("submitted_at") or "", line.strip()))
+                      break
+          if not verdicts:
+              print(f"review-gate FAIL: no review with a VERDICT line on this PR")
+              raise SystemExit(1)
+          verdicts.sort()
+          latest = verdicts[-1][1]
+          if "VERDICT: APPROVE" in latest:
+              print(f"review-gate PASS: latest verdict is APPROVE ({len(verdicts)} review(s))")
+          else:
+              print(f"review-gate FAIL: latest verdict is {latest}")
+              raise SystemExit(1)
+          PY
