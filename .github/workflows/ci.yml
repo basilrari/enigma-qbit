@@ -24,9 +24,11 @@ jobs:
       - run: python -m pip install --upgrade pip
       - name: Install deps
         run: |
-          pip install pytest
+          pip install numpy scipy qiskit
       - name: Run tests
-        run: python -m pytest tests/ -q
+        run: |
+          python tests/verify_rigor.py
+          python tests/verify_svd.py
 
   # Enforces the standard: a PR cannot merge until a review comment on it
   # carries a "VERDICT: APPROVE" line. (Self-approvals are blocked on
