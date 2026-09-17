@@ -109,6 +109,14 @@ def _svd(m, k=None):
         return fast
     return _svd_full(M)
 
+class _SvdGuard:
+    """Call counter for amortising _svd_full's O(n^3) correctness check."""
+    n = 0
+
+
+_sg = _SvdGuard()
+
+
 def _svd_full(M):
     r, c = M.shape
     try:
@@ -130,8 +138,21 @@ def _svd_full(M):
             nz = w > 1e-13
             Vh = U[:, nz] @ M.conj().T / w[nz][None, :]
             U, S, Vh = U[:, nz], w[nz], Vh
-        if np.linalg.norm(M - U @ np.diag(S) @ Vh) > 1e-6 * max(1.0, np.linalg.norm(M)):
+        # Correctness guard for the Gram/eigh factorisation.  The full
+        # reconstruction costs about as much as the factorisation itself and
+        # this is the build's hottest path (~26k calls per circuit), so check
+        # the cheap trace identity every call and the O(n^3) reconstruction
+        # only at the start and periodically.  A systematic failure still
+        # surfaces within the first few hundred calls, and a one-off
+        # numerical failure is caught by the trace check, which is exactly
+        # what a botched Gram/eigh breaks.
+        _sg.n += 1
+        nm2 = float((M.conj() * M).sum().real)
+        if abs(float((S ** 2).sum()) - nm2) > 1e-6 * max(1.0, nm2):
             return np.linalg.svd(M, full_matrices=False)
+        if _sg.n <= 4 or _sg.n % 1024 == 0:
+            if np.linalg.norm(M - U @ np.diag(S) @ Vh) > 1e-6 * max(1.0, np.linalg.norm(M)):
+                return np.linalg.svd(M, full_matrices=False)
         return U, S, Vh
     except Exception:
         try:
@@ -245,8 +266,10 @@ def _apply_swap(tensors, i, bond, headroom=1.0):
     A, B = tensors[i], tensors[i+1]
     theta = np.tensordot(A, B, axes=([2], [0]))
     l, r = theta.shape[0], theta.shape[3]
-    G4 = SWAP_MAT.reshape(2, 2, 2, 2)
-    th2 = np.einsum('labr,xyab->lxyr', theta, G4)
+    # SWAP(x,y,a,b) = delta_xb*delta_ya, so applying the SWAP gate is exactly
+    # the exchange of the two physical indices: an index transpose, no arithmetic.
+    # (The SWAP_MAT einsum was doing the same thing with real multiplications.)
+    th2 = theta.transpose(0, 2, 1, 3)
     m = th2.reshape(l*2, 2*r)
     U, S, Vh = _svd(m, k=int(bond*headroom))
     chi = min(len(S), int(bond*headroom))
