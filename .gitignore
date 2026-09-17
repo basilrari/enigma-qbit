@@ -16,3 +16,7 @@ Thumbs.db
 *.log
 *.tmp
 results/
+sampling_results/
+*_report.txt
+hqp_result.json
+smoke_*.json

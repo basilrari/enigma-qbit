@@ -631,6 +631,81 @@ class MPS:
             p1[i] = (abs(a1) ** 2 / d) if d > 0 else 0.5
         return p1
 
+    # ------------------------------------------------------------------
+    # Exact conditional sampling -> heavy-hitter search
+    # ------------------------------------------------------------------
+    def suffix_norms(self):
+        """Gauge-independent suffix norm environments.
+
+        R[n] = 1,  R[k] = sum_v T_k^v R[k+1] (T_k^v)^H   (shape l_k x l_k).
+
+        Then with v_k the row prefix-vector after sites 0..k-1,
+            P(b_<k)          = v_k R_k v_k^H
+            P(b_k = v|b_<k)  = (v_k T_k^v) R_{k+1} (v_k T_k^v)^H / P(b_<k)
+        which is exact for ANY gauge -- no canonical form or sweep needed.
+        Cost is O(n chi^3) once, then O(chi^2) per sampled bit.
+        """
+        T, n = self.T, self.n
+        R = [None] * (n + 1)
+        R[n] = np.ones((1, 1), dtype=complex)
+        for k in range(n - 1, -1, -1):
+            acc = None
+            for v in (0, 1):
+                A = T[k][:, v, :]
+                term = A @ R[k + 1] @ A.conj().T
+                acc = term if acc is None else acc + term
+            R[k] = acc
+        return R
+
+    def sample(self, nsamples, rng=None, batch=4000, R=None):
+        """Draw exact samples from this MPS.
+
+        Returns {bitstring: count} with bitstrings in ORIGINAL qubit order
+        (same convention as amp()/P()).  This is the operation the challenge's
+        own reference solver performs (Aer MPS + shots + take the mode), and
+        it is FAR more robust to truncation than hill-climbing: heavy-hitter
+        MASS survives truncation, whereas fine amplitude ORDERING does not.
+        """
+        rng = np.random.default_rng() if rng is None else rng
+        if R is None:
+            R = self.suffix_norms()
+        T, n, qo = self.T, self.n, self.qo
+        cnt = {}
+        left = int(nsamples)
+        while left > 0:
+            N = min(batch, left)
+            V = np.ones((N, 1), dtype=complex)
+            bits = np.zeros((N, n), dtype=np.uint8)
+            for k in range(n):
+                Tk = T[k]
+                A0 = V @ Tk[:, 0, :]              # (N, r)
+                A1 = V @ Tk[:, 1, :]
+                Rk = R[k + 1]
+                p0 = np.einsum('ni,ij,nj->n', A0, Rk, A0.conj()).real
+                p1 = np.einsum('ni,ij,nj->n', A1, Rk, A1.conj()).real
+                np.maximum(p0, 0.0, out=p0)
+                np.maximum(p1, 0.0, out=p1)
+                tot = p0 + p1
+                tot[tot <= 0] = 1.0
+                b = (rng.random(N) >= (p0 / tot)).astype(np.uint8)
+                bits[:, k] = b
+                V = np.where(b[:, None] == 0, A0, A1)
+            for row in bits:
+                s = ['0'] * n
+                for k in range(n):
+                    if row[k]:
+                        s[qo[k]] = '1'
+                key = ''.join(s)
+                cnt[key] = cnt.get(key, 0) + 1
+            left -= N
+        return cnt
+
+    def heavy_hitters(self, nsamples, top=16, rng=None, batch=4000):
+        """Top-`top` sampled states by frequency, plus the full histogram."""
+        cnt = self.sample(nsamples, rng=rng, batch=batch)
+        ranked = sorted(cnt.items(), key=lambda kv: -kv[1])
+        return ranked[:top], cnt
+
 # ----------------------------------------------------------------------
 # Search
 # ----------------------------------------------------------------------
@@ -792,6 +867,10 @@ def main():
     ap.add_argument("--top", type=int, default=65536,
                     help="exact-amp stage-2 size")
     ap.add_argument("--restarts", type=int, default=8)
+    ap.add_argument("--samples", type=int, default=0,
+                    help="exact MPS samples; top hits become extra warm starts")
+    ap.add_argument("--hh-top", type=int, default=16,
+                    help="how many sampled heavy hitters to seed the search with")
     ap.add_argument("--save-tensors")
     ap.add_argument("--out", default="hqp_result.json")
     args = ap.parse_args()
@@ -890,6 +969,27 @@ def main():
         if peak:
             log(f"fused: H = {sum(a!=b for a,b in zip(starts['fused'],peak))}")
 
+    # ---- heavy-hitter warm starts (exact MPS sampling) ----
+    # Every start above is derived from the SAME marginals, so independent
+    # restarts only ever explore one basin.  Sampling the MPS distribution
+    # gives diverse, probability-weighted candidates that marginal-based
+    # hill-climbing structurally cannot reach.
+    if args.samples > 0:
+        try:
+            hh, cnt = mps.heavy_hitters(args.samples, top=args.hh_top)
+        except Exception as ex:
+            hh, cnt = [], {}
+            log(f"sampling failed: {type(ex).__name__}: {ex}")
+        if hh:
+            log(f"sampled {args.samples} states -> {len(cnt)} distinct; "
+                f"top hit count {hh[0][1]}")
+            log(f"sampled distinct fraction = {len(cnt)/args.samples:.4f} "
+                f"(near 1.0 => distribution is flat / no heavy hitter)")
+            for i, (s, c) in enumerate(hh):
+                starts[f"hh{i}"] = s
+                log(f"  hh{i}: count={c} H="
+                    f"{sum(a != b for a, b in zip(s, peak)) if peak else '?'}")
+
     # ---- search: refine each start, keep global best ----
     # Seed from the known peak (from meta) when available: refine() runs
     # enum+ascent+polish+restarts from it, so a true local max is returned
@@ -898,7 +998,9 @@ def main():
         starts["peak"] = peak
         log(f"seeded from known peak: H=0 (definitionally)")
     best_all, bestP_all = None, -1.0
-    for name in ("peak", "maj", "sumamp", "fused", "lastu"):
+    search_order = (["peak", "maj", "sumamp", "fused", "lastu"]
+                    + [f"hh{i}" for i in range(args.hh_top)])
+    for name in search_order:
         if name not in starts:
             continue
         if search_deadline and time.time() > search_deadline:
