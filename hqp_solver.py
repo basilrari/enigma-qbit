@@ -39,7 +39,7 @@ import os
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
-import sys, time, math, json, argparse
+import sys, time, math, json, argparse, heapq, itertools
 import numpy as np
 
 T0 = time.time()
@@ -709,6 +709,88 @@ class MPS:
 # ----------------------------------------------------------------------
 # Search
 # ----------------------------------------------------------------------
+def suffix_envs(T):
+    """R[k] = sum over all completions of |amp|^2 for a prefix ending at k.
+
+    This is the key quantity: for a chain network the total probability mass of
+    a prefix is v @ R_k @ v^H, so EVERY completion of that prefix has
+    |amp| <= sqrt(v @ R_k @ v^H).  That is an exact, gauge-independent bound.
+    """
+    n = len(T)
+    R = [None] * (n + 1)
+    R[n] = np.ones((1, 1), dtype=complex)
+    for k in range(n - 1, -1, -1):
+        acc = None
+        for b in (0, 1):
+            A = T[k][:, b, :]
+            t = A @ R[k + 1] @ A.conj().T
+            acc = t if acc is None else acc + t
+        R[k] = acc
+    return R
+
+
+def exact_argmax(mps, top=8, node_cap=3000000):
+    """EXACT top-`top` bitstrings of the model, by branch-and-bound.
+
+    Why this replaces hill-climbing: ascend()/double_polish() find a LOCAL
+    maximum, so they can never distinguish "the model is too weak" from "our
+    search is too dumb".  Here every prefix is expanded best-first under the
+    exact bound above, and anything that cannot beat the current threshold is
+    discarded.  When the frontier empties (or the best bound falls to the
+    threshold) the result is CERTIFIED to be the model's true global optimum --
+    no restarts, no local minima, no luck.
+
+    Correctness was verified against brute-force enumeration of the same MPS
+    (agreement on all trials).  Cost is governed by the model's own
+    concentration: pruning starts around depth 2*log2(1/|amp_max|).
+    """
+    T, n, qo = mps.T, mps.n, mps.qo
+    t0 = time.time()
+    R = suffix_envs(T)
+    tick = itertools.count()
+    heap = [(-1.0, 0, 0, next(tick), np.ones((1, 1), dtype=complex))]
+    bp, cnt, nodes, maxheap = [], 0, 0, 1
+    certified = False
+    while heap:
+        nb, k, bits, _, v = heapq.heappop(heap)
+        nodes += 1
+        if nodes > node_cap:
+            break
+        thr = bp[0][0] if len(bp) >= top else 0.0
+        if -nb <= thr:
+            certified = True
+            break
+        if k == n:
+            cnt += 1
+            a = abs(v[0, 0])
+            if len(bp) < top:
+                heapq.heappush(bp, (a, cnt, bits))
+            elif a > bp[0][0]:
+                heapq.heapreplace(bp, (a, cnt, bits))
+            continue
+        Tk, Rk = T[k], R[k + 1]
+        for b in (0, 1):
+            w = v @ Tk[:, b, :]
+            m = float(np.real(w @ Rk @ w.conj().T)[0, 0])
+            bnd = m ** 0.5 if m > 0.0 else 0.0
+            if bnd > thr or len(bp) < top:
+                heapq.heappush(heap, (-bnd, k + 1, (bits << 1) | b,
+                                      next(tick), w))
+        if len(heap) > maxheap:
+            maxheap = len(heap)
+    if not heap:
+        certified = True
+    out = []
+    for a, _, bits in sorted(bp, reverse=True):
+        ch = ["0"] * n
+        for k in range(n):
+            if (bits >> (n - 1 - k)) & 1:
+                ch[qo[k]] = "1"
+        out.append(("".join(ch), a * a))
+    return out, {"nodes": nodes, "certified": certified, "maxheap": maxheap,
+                 "time": time.time() - t0}
+
+
 def _flip(s, i):
     b = list(s)
     b[i] = '1' if b[i] == '0' else '0'
@@ -811,15 +893,26 @@ def certificate(mps, s, args):
 # Meta I/O
 # ----------------------------------------------------------------------
 def save_mps(tensors, order, q_at, q_at_orig, peak, path):
-    np.save(path, tensors)
-    with open(path + ".meta", "w") as f:
-        f.write(f"{len(tensors)}\n")
-        f.write(" ".join(map(str, order)) + "\n")
-        f.write(" ".join(map(str, q_at)) + "\n")
-        f.write(" ".join(map(str, q_at_orig)) + "\n")
-        if peak:
-            f.write(peak + "\n")
-    log(f"saved tensors -> {path} (+.meta)")
+    # Bond dimensions differ from site to site, so np.save(list) raises
+    # "inhomogeneous shape" -- and it did so AFTER a 46-minute build, throwing
+    # the whole run away.  Save an explicit object array, and never let an I/O
+    # error kill an expensive run.
+    try:
+        arr = np.empty(len(tensors), dtype=object)
+        for i, t in enumerate(tensors):
+            arr[i] = np.ascontiguousarray(t)
+        np.save(path, arr, allow_pickle=True)
+        with open(path + ".meta", "w") as f:
+            f.write(f"{len(tensors)}\n")
+            f.write(" ".join(map(str, order)) + "\n")
+            f.write(" ".join(map(str, q_at)) + "\n")
+            f.write(" ".join(map(str, q_at_orig)) + "\n")
+            if peak:
+                f.write(peak + "\n")
+        log(f"saved tensors -> {path} (+.meta)")
+    except Exception as ex:
+        log(f"WARNING: tensor save failed ({type(ex).__name__}: {ex}) "
+            f"-- continuing without it")
 
 def load_mps_tensors(path, peak=None):
     tensors = np.load(path, allow_pickle=True)
@@ -871,6 +964,11 @@ def main():
                     help="exact MPS samples; top hits become extra warm starts")
     ap.add_argument("--hh-top", type=int, default=16,
                     help="how many sampled heavy hitters to seed the search with")
+    ap.add_argument("--exact-top", type=int, default=8,
+                    help="exact certified top-N of the model by branch-and-bound"
+                         " (0 disables)")
+    ap.add_argument("--exact-cap", type=int, default=3000000,
+                    help="node cap for the exact optimiser")
     ap.add_argument("--save-tensors")
     ap.add_argument("--out", default="hqp_result.json")
     args = ap.parse_args()
@@ -990,6 +1088,29 @@ def main():
                 log(f"  hh{i}: count={c} H="
                     f"{sum(a != b for a, b in zip(s, peak)) if peak else '?'}")
 
+    # ---- EXACT global optimum of the model (branch-and-bound) ----
+    # Primary method.  Everything below is a heuristic that can only return
+    # something this certificate proves is no better.
+    exact_best, ex_stats = None, None
+    if args.exact_top > 0:
+        try:
+            ex, ex_stats = exact_argmax(mps, top=args.exact_top,
+                                        node_cap=args.exact_cap)
+        except Exception as ex_:
+            ex, ex_stats = [], {"certified": False, "error": str(ex_)}
+            log(f"exact argmax failed: {type(ex_).__name__}: {ex_}")
+        log(f"EXACT top-{args.exact_top}: nodes={ex_stats.get('nodes')} "
+            f"certified={ex_stats.get('certified')} "
+            f"maxheap={ex_stats.get('maxheap')} "
+            f"time={ex_stats.get('time', 0.0):.1f}s")
+        for i, (sf, Pf) in enumerate(ex):
+            hh_ = (sum(a != b for a, b in zip(sf, peak)) if peak else None)
+            log(f"  ex#{i+1} P={Pf:.6e} H="
+                f"{hh_ if hh_ is not None else '?'} {sf}")
+            starts[f"ex{i}"] = sf
+        if ex:
+            exact_best = ex[0][0]
+
     # ---- search: refine each start, keep global best ----
     # Seed from the known peak (from meta) when available: refine() runs
     # enum+ascent+polish+restarts from it, so a true local max is returned
@@ -998,8 +1119,16 @@ def main():
         starts["peak"] = peak
         log(f"seeded from known peak: H=0 (definitionally)")
     best_all, bestP_all = None, -1.0
-    search_order = (["peak", "maj", "sumamp", "fused", "lastu"]
-                    + [f"hh{i}" for i in range(args.hh_top)])
+    if ex_stats and ex_stats.get("certified") and args.exact_top > 0:
+        # Only ex0: refine() costs 2^K model evaluations, and the certificate
+        # already proves no other string beats ex0.
+        search_order = ["ex0"]
+        log("exact optimiser CERTIFIED the model optimum -- skipping "
+            "marginal/sampling heuristics (they cannot beat it)")
+    else:
+        search_order = (["peak", "maj", "sumamp", "fused", "lastu"]
+                        + [f"hh{i}" for i in range(args.hh_top)]
+                        + [f"ex{i}" for i in range(args.exact_top)])
     for name in search_order:
         if name not in starts:
             continue

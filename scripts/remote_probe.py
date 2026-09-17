@@ -1,6 +1,7 @@
+import os
 import paramiko, sys
 
-HOST, USER, PASS = "140.123.105.18", "basilrari", "iloveesl"
+HOST, USER, PASS = os.environ.get("SRVPRO_PASS", ""), "basilrari", "iloveesl"
 c = paramiko.SSHClient()
 c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 c.connect(HOST, username=USER, password=PASS, timeout=30)

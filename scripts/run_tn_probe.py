@@ -1,6 +1,7 @@
+import os
 import paramiko, sys, time
 
-HOST, USER, PASS = "140.123.105.18", "basilrari", "iloveesl"
+HOST, USER, PASS = os.environ.get("SRVPRO_PASS", ""), "basilrari", "iloveesl"
 LOCAL = "/home/basilsclaw/enigma-solve/scripts/tn_width_probe.py"
 REMOTE = "/mnt/8tb_hdd2/basilrari/enigma-work/verify/tn_width_probe.py"
 PY = "/mnt/8tb_hdd2/basilrari/enigma-work/l2venv/bin/python"

@@ -4,9 +4,10 @@
 Key question: does SAMPLING (heavy-hitter search) find the planted peak where
 our old hill-climbing search did not?
 """
+import os
 import paramiko, json, sys, os
 
-HOST, USER, PASS = "140.123.105.18", "basilrari", "iloveesl"
+HOST, USER, PASS = os.environ.get("SRVPRO_PASS", ""), "basilrari", "iloveesl"
 VER = "/mnt/8tb_hdd2/basilrari/enigma-work/verify"
 LOCAL = "/home/basilsclaw/enigma-solve/sampling_results"
 os.makedirs(LOCAL, exist_ok=True)

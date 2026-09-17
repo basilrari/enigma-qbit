@@ -1,6 +1,7 @@
+import os
 import paramiko, sys, os
 
-HOST, USER, PASS = "140.123.105.18", "basilrari", "iloveesl"
+HOST, USER, PASS = os.environ.get("SRVPRO_PASS", ""), "basilrari", "iloveesl"
 VER = "/mnt/8tb_hdd2/basilrari/enigma-work/verify"
 PY = "/mnt/8tb_hdd2/basilrari/enigma-work/l2venv/bin/python"
 LOCAL = "/home/basilsclaw/enigma-solve/scripts"
