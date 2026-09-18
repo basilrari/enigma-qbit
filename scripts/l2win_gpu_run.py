@@ -112,9 +112,16 @@ def main():
 
     # Which site->logical convention is right? Score them all with amp2, which
     # NORMALISES, so the values are directly comparable. Target 1e-3..1e-1.
-    cands = {"identity": list(range(n)), "tracked": list(_PERM), "final": list(final_perm)}
+    tr = list(_PERM)
+    fl = list(final_perm)
+    cands = {"identity": list(range(n)), "tracked": tr, "final": fl}
     try:
-        cands["tracked^-1"] = [list(_PERM).index(j) for j in range(n)]
+        cands["tracked^-1"] = [tr.index(j) for j in range(n)]
+    except Exception:
+        pass
+    try:
+        cands["tracked.final"] = [tr[fl[s]] for s in range(n)]
+        cands["final.tracked"] = [fl[tr[s]] for s in range(n)]
     except Exception:
         pass
     if truth:
