@@ -71,9 +71,20 @@ def upload_sync(c):
 
 
 def run(c, cmd, timeout=60):
-    _, o, _ = c.exec_command(cmd, timeout=timeout)
-    o.channel.recv_exit_status()
-    return o.read().decode()
+    # Never raise: a wedged channel must not abort a 4-arm grid.
+    try:
+        _, o, _ = c.exec_command(cmd, timeout=timeout)
+        out = o.read().decode()
+        o.channel.recv_exit_status()
+        return out
+    except Exception as exc:
+        return f"[run-error {type(exc).__name__}]"
+
+
+# pkill -f matches this shell's OWN command line if the pattern is written
+# literally, which kills the ssh session and hangs the channel.  The bracket
+# trick makes the shell's cmdline (l2_absor[b].py) not match its own regex.
+KILL = "pkill -f 'l2_absor[b].py' 2>/dev/null; sleep 2; pgrep -fc 'l2_absor[b].py' || echo 0"
 
 
 def main():
@@ -81,7 +92,7 @@ def main():
     upload_sync(c)
 
     # clear the deck: the livelocked runs are not producing anything
-    run(c, "pkill -f l2_absorb.py; sleep 2; pgrep -fc l2_absorb.py || true")
+    print("[kill] remaining absorb procs -> " + run(c, KILL).strip(), flush=True)
     print("=== knob grid on d2, " + str(ARM_SECONDS) + "s per arm ===", flush=True)
 
     results = []
@@ -108,7 +119,7 @@ def main():
                         "VERDICT" in log and "H=" in log))
         print(f"[{tag}] t_u={last_u}  bond_max={results[-1][2]} "
               f"bond_last={results[-1][3]}  stall_ons={stalled}", flush=True)
-        run(c, "pkill -f l2_absorb.py || true", timeout=30)
+        run(c, KILL, timeout=60)
         time.sleep(5)
 
     print("\n=== summary (arms, 100s of unitaries of 2860) ===")
