@@ -20,3 +20,7 @@ sampling_results/
 *_report.txt
 hqp_result.json
 smoke_*.json
+
+# third-party engine pulled from the shared box for reference only (published
+# by the challenge leaders; not ours to redistribute)
+l2win_ref/
