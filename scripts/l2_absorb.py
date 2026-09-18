@@ -143,7 +143,8 @@ def main():
 
     deadline = t0 + args.budget
     mpo, L_left, L_right, stats = US.mpo_compress_unswap(
-        uqc, max_bond=args.max_bond, cutoff=args.cutoff, unswap_threshold=1e6,
+        uqc, max_bond=args.max_bond, cutoff=args.cutoff,
+        unswap_threshold=float(os.environ.get("HQP_UNSWAP_THRESHOLD", "1e6")),
         early_stopping_gates=args.early_stop, center_ratio=args.center_ratio,
         to_backend=to_backend, seed=args.seed, deadline=deadline)
     t_abs = time.time() - t0
