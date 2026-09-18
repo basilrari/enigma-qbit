@@ -164,6 +164,95 @@ def amplitude(n, gates, bits, optimize="greedy", slice_bits=24, verbose=False):
     return complex(val), time.time() - t0
 
 
+class ReusableOracle:
+    """Pick the contraction path ONCE, then evaluate many bitstrings cheaply.
+
+    The path depends only on the network *structure*, which is identical for
+    every bitstring -- only the 2n boundary vectors change.  Re-searching per
+    string (what amplitude() does) is pure waste: it spent minutes on a single
+    d1 amplitude.
+
+    This is the enabling measurement.  If one amplitude costs minutes, no
+    search is possible and the method is dead.  If it costs milliseconds,
+    finding the peak becomes a combinatorial problem we can actually attack.
+    """
+
+    def __init__(self, n, gates, slice_bits=24, reps=32, verbose=True):
+        import cotengra as ctg
+        self.n, self.gates, self.ctg = n, gates, ctg
+        # dummy bits: only the boundary *values* get overwritten later
+        self.tn = build_tn(n, gates, "0" * n)
+        self.tensors = list(self.tn.tensors)
+        self.inds = [list(map(str, t.inds)) for t in self.tensors]
+        arrays = [t.data for t in self.tensors]
+
+        opt = (ctg.HyperOptimizer(max_repeats=reps, progbar=False,
+                                  slicing_opts={"target_size": 2 ** slice_bits})
+               if slice_bits else "greedy")
+        # cotengra wants (inputs, output, size_dict) -- NOT the arrays.  Passing
+        # arrays where the einsum inputs belong makes every trial fail with
+        # KeyError: 'tree'.  Every index here is a qubit wire, so size 2.
+        size_dict = {}
+        for t in self.tensors:
+            for i in t.inds:
+                size_dict[str(i)] = 2
+        t0 = time.time()
+        try:
+            self.tree = opt.search(self.inds, [], size_dict)
+        except Exception as exc:
+            err = None
+            try:
+                err = opt.best.get("error")
+            except Exception:
+                pass
+            raise RuntimeError(f"path search failed: {err or exc}") from exc
+        self.search_s = time.time() - t0
+
+        try:
+            self.cost = float(self.tree.contraction_cost())
+            self.width = float(self.tree.contraction_width())
+        except Exception:
+            self.cost = self.width = float("nan")
+        self.sliced = tuple(str(i) for i in getattr(self.tree, "sliced_inds", ()))
+        self.nslices = 2 ** len(self.sliced)
+
+        # Probe which contraction call this cotengra build actually supports.
+        self.mode, self._fn = None, None
+        for name, fn in (
+            ("tree.contract", lambda a: self.tree.contract(a)),
+            ("ctg.array_contract", lambda a: ctg.array_contract(
+                a, self.inds, [], optimize=self.tree, progbar=False)),
+            ("tn+path", lambda a: self.tn.contract(
+                optimize=self.tree.get_path())),
+        ):
+            try:
+                fn(arrays)
+                self.mode, self._fn = name, fn
+                break
+            except Exception:
+                continue
+        if self.mode is None:
+            raise RuntimeError("no working contraction call for this cotengra")
+        if verbose:
+            print(f"[path] search {self.search_s:.1f}s via {self.mode} "
+                  f"log2flops={self.cost:.1f} log2width={self.width:.1f} "
+                  f"slices=2**{len(self.sliced)}", flush=True)
+
+    def _vector(self, bit):
+        v = np.zeros(2, dtype=complex)
+        v[int(bit)] = 1.0
+        return v
+
+    def amplitude(self, bits):
+        """Exact <bits|U|0>, reusing the cached path."""
+        for q in range(self.n):
+            self.tn[f"out{q}"].modify(data=self._vector(bits[q]))
+        arrays = [t.data for t in self.tensors]
+        t0 = time.time()
+        val = self._fn(arrays)
+        return complex(np.asarray(val).reshape(-1)[0]), time.time() - t0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--qasm", required=True)
@@ -174,6 +263,12 @@ def main():
     ap.add_argument("--slice", type=int, default=24, dest="slice_bits",
                     help="slice large indices to bound memory (0 = no slicing)")
     ap.add_argument("--width", action="store_true", help="report path stats only")
+    ap.add_argument("--stats", action="store_true",
+                    help="search the path ONCE then time many amplitudes")
+    ap.add_argument("--bits-file", default=None,
+                    help="file of bitstrings, one per line (search mode)")
+    ap.add_argument("--reps", type=int, default=32,
+                    help="cotengra HyperOptimizer repeats")
     args = ap.parse_args()
 
     n, gates, unmatched = parse_qasm(args.qasm)
@@ -184,6 +279,35 @@ def main():
         # instead of contracting an empty network.
         print("[skip] no u/cz gates (different gate set); "
               f"first unmatched line: {unmatched[0] if unmatched else '(none)'}")
+        return
+
+    if args.stats:
+        if args.slice_bits < 1:
+            print("[error] --stats needs slicing (--slice >= 1) so the path "
+                  "search returns a tree we can reuse")
+            return
+        rng = np.random.default_rng(args.seed)
+        oracle = ReusableOracle(n, gates, args.slice_bits, reps=args.reps)
+        strings = []
+        if args.bits_file:
+            strings += [l.strip() for l in open(args.bits_file) if l.strip()]
+        elif args.bits:
+            strings.append(args.bits)
+        for k in range(args.random if strings else max(args.random, 3)):
+            strings.append("".join(rng.integers(0, 2, n).astype(str)))
+        print(f"[eval] {len(strings)} strings with the cached path", flush=True)
+        best = (None, -1.0)
+        t_all = time.time()
+        for i, b in enumerate(strings):
+            amp, dt = oracle.amplitude(b)
+            p = abs(amp) ** 2
+            if p > best[1]:
+                best = (b, p)
+            print(f"  [{i}] |amp|^2={p:.6e} {dt*1000:.1f}ms bits={b}", flush=True)
+        tot = time.time() - t_all
+        print(f"[summary] total {tot:.1f}s for {len(strings)} strings "
+              f"=> {tot/max(len(strings),1)*1000:.1f}ms each")
+        print(f"[peak] best |amp|^2={best[1]:.6e} bits={best[0]}")
         return
 
     if args.width:
