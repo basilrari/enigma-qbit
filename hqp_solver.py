@@ -40,6 +40,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 import sys, time, math, json, argparse, heapq, itertools
+import base64, io, zipfile
 import numpy as np
 
 T0 = time.time()
@@ -993,6 +994,76 @@ def load_mps_tensors(path, peak=None):
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Official solution-output protocol
+# ----------------------------------------------------------------------
+# From qbittensor.challenges.solution_output: the validator captures stdout
+# via `docker logs`, and Docker's json-file driver corrupts raw binary, so the
+# artifact zip is base64-encoded behind a magic separator line.
+_SOLUTION_OUTPUT_SEPARATOR = (
+    b"\n----- ENIGMA-SOLUTION-OUTPUT-BEGIN-a8c7f3e2-9d4b-4c5a-8f1e-2b6d3a4e5f7c -----\n"
+)
+_CHALLENGE_INPUT_JSON_PATH = "/challenge_input/challenge_input.json"
+
+
+def emit_solution_output(result, solve_info=None, enabled=True):
+    """Emit the challenge's stdout protocol: logs, separator, base64(zip).
+
+    This MUST be the last thing written to stdout -- anything after it
+    corrupts the payload and the validator cannot extract the artifacts.
+
+    result.json must carry BOTH keys the validator reads: `status` (the
+    literal string "success"; validate_hqp_solution checks it FIRST when
+    require_success_status is set, so a perfect bitstring alone is rejected)
+    and `peaked_state`.
+    """
+    if not enabled:
+        return
+    # Prefer the challenge's own helpers when importable: the solver runs
+    # inside the challenge image, where qbittensor is installed, and using the
+    # official framing guarantees the separator and zip layout match byte for
+    # byte.  Fall back to the inline copy for local runs outside that image.
+    try:
+        from qbittensor.challenges.solution_output import (
+            build_solution_result_zip, write_solution_output)
+        write_solution_output(build_solution_result_zip(
+            json.dumps(result, indent=1),
+            json.dumps(solve_info, indent=1) if solve_info is not None else None))
+        return
+    except Exception:
+        pass
+    files = {"result.json": json.dumps(result, indent=1)}
+    if solve_info is not None:
+        files["solve_info.json"] = json.dumps(solve_info, indent=1)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stdout.buffer.write(_SOLUTION_OUTPUT_SEPARATOR)
+    sys.stdout.buffer.write(base64.b64encode(buf.getvalue()))
+    sys.stdout.buffer.write(b"\n")
+    sys.stdout.buffer.flush()
+
+
+def load_challenge_input():
+    """Resolve the circuit from the challenge's own input contract.
+
+    Two modes, per qbittensor.challenges.hardening_quantum_proof:
+      - workbench/CLI: argv is [script, challenge_id, problem_json]
+      - validator container: no args; read the read-only /challenge_input mount
+    Returns (qasm_path_or_None, difficulty_or_None).
+    """
+    if len(sys.argv) == 3:
+        prob = json.loads(sys.argv[2])
+        return prob.get("qasm_file"), prob.get("difficulty")
+    if os.path.isfile(_CHALLENGE_INPUT_JSON_PATH):
+        prob = json.load(open(_CHALLENGE_INPUT_JSON_PATH))
+        return prob.get("qasm_file"), prob.get("difficulty")
+    return None, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--qasm")
@@ -1017,7 +1088,19 @@ def main():
                     help="node cap for the exact optimiser")
     ap.add_argument("--save-tensors")
     ap.add_argument("--out", default="hqp_result.json")
+    ap.add_argument("--no-protocol", action="store_true",
+                    help="skip the stdout solution-output protocol")
+    ap.add_argument("--difficulty", type=int, default=None)
     args = ap.parse_args()
+
+    # Honour the challenge's own input contract when no circuit is named.
+    if not args.qasm and not args.tensors:
+        _q, _d = load_challenge_input()
+        if _q:
+            args.qasm = _q
+            log(f"challenge input: {_q} (difficulty={_d})")
+        if args.difficulty is None:
+            args.difficulty = _d
 
     deadline = T0 + args.budget if args.budget > 0 else None
     search_deadline = (deadline - 60) if deadline else None  # keep 60s for output
@@ -1215,6 +1298,24 @@ def main():
     print()
     print("=== HQP ANSWER ===")
     print(f"ANSWER: {best_all}")
+
+    # ---- official submission protocol (must be the LAST stdout write) ----
+    # The validator reads result.json and checks `status` FIRST: it must be
+    # the literal string "success", otherwise a perfect bitstring is rejected
+    # on the missing field alone.  `peaked_state` is the answer.
+    submission = {
+        "status": "success" if best_all else "failed",
+        "peaked_state": best_all or None,
+        "difficulty": args.difficulty,
+        "n_qubits": n,
+        "elapsed_s": now(),
+        "chi": args.chi,
+    }
+    emit_solution_output(
+        submission,
+        solve_info={k: v for k, v in result.items() if not isinstance(v, (list, dict))},
+        enabled=not args.no_protocol,
+    )
 
 if __name__ == "__main__":
     main()
