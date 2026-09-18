@@ -118,48 +118,25 @@ _sg = _SvdGuard()
 
 
 def _svd_full(M):
-    r, c = M.shape
+    """Exact dense SVD.
+
+    Deliberately calls LAPACK directly instead of factoring the Gram matrix
+    M^H M.  The Gram route squares the condition number: for a tensor whose
+    entries sit at ~5e5 (measured on the real circuits -- see the engine probe),
+    the eigh noise floor lands near eps*||M||^2 ~ 2.5e-5 while the old absolute
+    cutoff kept every singular value above 1e-13.  That retains singular
+    *directions* that are pure numerical noise, and those directions then eat
+    bond-dimension budget that should be carrying signal.  The trace-identity
+    guard could not catch it, because the spurious values are too small to move
+    ||S||^2.  LAPACK's dgesdd avoids the squaring entirely; at these sizes the
+    extra cost is negligible against the build.
+    """
     try:
-        if r >= c:
-            G = M.conj().T @ M
-            w, V = np.linalg.eigh(G)
-            w = np.sqrt(np.clip(w.real, 0.0, None))
-            idx = np.argsort(w)[::-1]
-            w, V = w[idx], V[:, idx]
-            nz = w > 1e-13
-            U = M @ (V[:, nz] / w[nz][None, :])
-            U, S, Vh = U, w[nz], V[:, nz].conj().T
-        else:
-            G = M @ M.conj().T
-            w, U = np.linalg.eigh(G)
-            w = np.sqrt(np.clip(w.real, 0.0, None))
-            idx = np.argsort(w)[::-1]
-            w, U = w[idx], U[:, idx]
-            nz = w > 1e-13
-            Vh = U[:, nz] @ M.conj().T / w[nz][None, :]
-            U, S, Vh = U[:, nz], w[nz], Vh
-        # Correctness guard for the Gram/eigh factorisation.  The full
-        # reconstruction costs about as much as the factorisation itself and
-        # this is the build's hottest path (~26k calls per circuit), so check
-        # the cheap trace identity every call and the O(n^3) reconstruction
-        # only at the start and periodically.  A systematic failure still
-        # surfaces within the first few hundred calls, and a one-off
-        # numerical failure is caught by the trace check, which is exactly
-        # what a botched Gram/eigh breaks.
-        _sg.n += 1
-        nm2 = float((M.conj() * M).sum().real)
-        if abs(float((S ** 2).sum()) - nm2) > 1e-6 * max(1.0, nm2):
-            return np.linalg.svd(M, full_matrices=False)
-        if _sg.n <= 4 or _sg.n % 1024 == 0:
-            if np.linalg.norm(M - U @ np.diag(S) @ Vh) > 1e-6 * max(1.0, np.linalg.norm(M)):
-                return np.linalg.svd(M, full_matrices=False)
-        return U, S, Vh
-    except Exception:
-        try:
-            return np.linalg.svd(M, full_matrices=False)
-        except np.linalg.LinAlgError:
-            import scipy.linalg as sla
-            return sla.svd(M, full_matrices=False, lapack_driver='gesdd')
+        return np.linalg.svd(M, full_matrices=False)
+    except np.linalg.LinAlgError:
+        import scipy.linalg as sla
+        return sla.svd(M, full_matrices=False, lapack_driver="gesdd")
+
 
 def _svd_topk(M, kk):
     """Top-k SVD by subspace iteration in the LEFT singular space (R^r),
