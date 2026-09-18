@@ -23,8 +23,14 @@ import paramiko
 W = "/mnt/8tb_hdd2/basilrari/enigma-work"
 V = f"{W}/verify"
 PY = f"{W}/l2venv/bin/python"
-ENV = ("OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 "
-       "NUMEXPR_NUM_THREADS=4")
+
+# Budget is a CLI arg: the measured throughput is ~4 units/min, so a 40-qubit
+# instance needs ~11h. Anything less just burns cores for a partial answer.
+BUDGET = sys.argv[1] if len(sys.argv) > 1 else "7200"
+THREADS = sys.argv[2] if len(sys.argv) > 2 else "4"
+
+ENV = (f"OMP_NUM_THREADS={THREADS} OPENBLAS_NUM_THREADS={THREADS} "
+       f"MKL_NUM_THREADS={THREADS} NUMEXPR_NUM_THREADS={THREADS}")
 
 TRUTH = {
     "d1_s1_4043cafb": "0001001101001111101001001110010001111010100000",
@@ -51,7 +57,7 @@ def main():
                f"--qasm {inst}.qasm --truth {TRUTH[inst]} "
                f"--max-bond 1024 --cutoff 0.002 "
                f"--max-bond-final 256 --cutoff-final 1e-5 "
-               f"--seed {seed} --budget 7200 "
+               f"--seed {seed} --budget {BUDGET} "
                f"> {V}/logs/{tag}.log 2>&1 < /dev/null & echo launched")
         _, o, _ = c.exec_command(cmd, timeout=60)
         o.channel.recv_exit_status()

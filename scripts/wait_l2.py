@@ -13,7 +13,7 @@ import paramiko
 W = "/mnt/8tb_hdd2/basilrari/enigma-work"
 V = f"{W}/verify"
 TAGS = ["l2_d2_b256", "l2_d1_b256"]
-MAX_HOURS = 3.0
+MAX_HOURS = 11.0
 
 
 def main():
