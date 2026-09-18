@@ -135,7 +135,17 @@ def _svd_full(M):
         return np.linalg.svd(M, full_matrices=False)
     except np.linalg.LinAlgError:
         import scipy.linalg as sla
-        return sla.svd(M, full_matrices=False, lapack_driver="gesdd")
+        try:
+            return sla.svd(M, full_matrices=False, lapack_driver="gesdd")
+        except Exception:
+            # Both drivers failing is almost always a non-finite input (an
+            # overflow upstream), NOT a LAPACK quirk.  Report which it is
+            # rather than leaving a misleading "SVD did not converge".
+            finite = bool(np.all(np.isfinite(M)))
+            mx = float(np.max(np.abs(M))) if M.size else 0.0
+            raise np.linalg.LinAlgError(
+                f"SVD failed on {M.shape}: all_finite={finite} "
+                f"max|M|={mx:.3e}")
 
 
 def _svd_topk(M, kk):
@@ -240,6 +250,10 @@ def reorder_qubits(circ):
     return new_ops, order
 
 def _apply_swap(tensors, i, bond, headroom=1.0):
+    # Guard BEFORE the tensordot: contracting two tensors forms PRODUCTS of
+    # entries, so scale compounds through a chain of swaps (one CZ can trigger
+    # ~40 of them) and can overflow to inf *between* any gate-level check.
+    _rescale(tensors)
     A, B = tensors[i], tensors[i+1]
     theta = np.tensordot(A, B, axes=([2], [0]))
     l, r = theta.shape[0], theta.shape[3]
@@ -274,6 +288,7 @@ def _move_center_left(tensors, c):
     tensors[c] = Vh.reshape(len(S), 2, r)
 
 def _apply_2site(tensors, i, mat, bond, renorm=True):
+    _rescale(tensors)   # same overflow guard as _apply_swap
     A, B = tensors[i], tensors[i+1]
     theta = np.tensordot(A, B, axes=([2], [0]))
     l, r = theta.shape[0], theta.shape[3]
