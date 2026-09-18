@@ -89,16 +89,23 @@ def main():
         qc, max_bond=max_bond, cutoff=cutoff, unswap_threshold=1e6,
         center_ratio=0.5, max_its=20, to_backend=utils.to_backend_cuda,
         seed=seed, hows=("both", "left", "right"), deadline=deadline)
-    real_l = [l for l in L_left if "measure" not in l.count_ops()]
-    real_r = [l for l in L_right if "measure" not in l.count_ops()]
+    # mpo_to_mps calls .inverse() on these layers, and `measure` has no
+    # inverse -- the engine cannot tolerate measurement layers, so the caller
+    # must strip them. (barrier likewise.)
+    def _real(layers):
+        return [l for l in layers
+                if 'measure' not in l.count_ops() and 'barrier' not in l.count_ops()]
+
+    L_left_real, L_right_real = _real(L_left), _real(L_right)
     print(f"[unswap] t={time.time()-t0:.0f}s calls={_CALLS['n']} "
-          f"L={len(real_l)} R={len(real_r)} perm={_PERM[:6]}...", flush=True)
+          f"L={len(L_left_real)} R={len(L_right_real)} perm={_PERM[:6]}...", flush=True)
 
     # the engine's OWN finalizer -- not a hand-rolled replay of the leftovers.
     # NOTE: it returns (mps, final_perm), and it merges+inverts the left layers
     # and applies them to a FRESH |0..0> MPS: left layers -> core MPO -> right.
-    psi, final_perm = unswap.mpo_to_mps(mpo_core, L_left, L_right, max_bond=208,
-                                        cutoff=1e-5, to_backend=utils.to_backend_cuda)
+    psi, final_perm = unswap.mpo_to_mps(mpo_core, L_left_real, L_right_real,
+                                        max_bond=208, cutoff=1e-5,
+                                        to_backend=utils.to_backend_cuda)
     print(f"[mps] t={time.time()-t0:.0f}s bond={psi.max_bond()} "
           f"norm={float(abs(complex(psi.norm()))):.6f} final_perm={list(final_perm)[:6]}...",
           flush=True)
