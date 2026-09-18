@@ -124,7 +124,7 @@ def main():
 
     print("\n=== summary (arms, 100s of unitaries of 2860) ===")
     for tag, last_u, bmax, blast, stalled, verdict in results:
-        print(f"  {tag:10s} units={last_u:>5s}  bond_max={bmax:<5d} "
+        print(f"  {tag:10s} units={last_u:>5}  bond_max={bmax:<5d} "
               f"bond_last={blast:<5d} stall_ons={stalled:<3d} extracted={verdict}")
     c.close()
 

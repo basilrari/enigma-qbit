@@ -334,6 +334,31 @@ def _bring_2q(tensors, pos_of, q_at, a, b, center, bond):
         _move_center_right(tensors, center); center += 1
     return pos_of, q_at, center, i
 
+def _rescale(tensors, thresh=1e8):
+    """Global renormalisation guard against overflow.
+
+    Applying gates pumps scale into the state -- measured entries reach ~5e5
+    by mid-circuit on the real instances -- and with no guard they eventually
+    overflow to inf.  That is fatal in a way that reads like a LAPACK quirk:
+    _svd_topk's isfinite guard returns None, the caller falls through to
+    _svd_full, and LAPACK raises "SVD did not converge" on the inf input.
+
+    Multiplying EVERY tensor by one common factor is both safe and free here.
+    The extractor takes an argmax, which is invariant under |psi> -> c|psi>,
+    so the accumulated constant never needs to be tracked.
+    """
+    m = 0.0
+    for t in tensors:
+        v = float(np.max(np.abs(t))) if t.size else 0.0
+        if v > m:
+            m = v
+    if m > thresh and np.isfinite(m):
+        f = 1.0 / m
+        for t in tensors:
+            t *= f
+    return m
+
+
 def build_mps(circ, bond, verbose=True, deadline=None):
     """Build the MPS by time-ordering the gates. NO pre-reorder: iterate
     circ.data directly with ORIGINAL qubit indices. pos_of (orig->slot) and
@@ -349,7 +374,11 @@ def build_mps(circ, bond, verbose=True, deadline=None):
     center = n - 1
     t0 = time.time(); ng = 0
     order = list(range(n))    # identity (no pre-reorder)
+    _ncheck = 0
     for inst in circ.data:
+        _ncheck += 1
+        if _ncheck % 4 == 0:
+            _rescale(tensors)   # overflow guard; argmax is scale-invariant
         op = inst.operation
         qs = [circ.find_bit(q).index for q in inst.qubits]
         nm = op.name.lower()

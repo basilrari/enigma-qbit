@@ -177,8 +177,14 @@ class ReusableOracle:
     finding the peak becomes a combinatorial problem we can actually attack.
     """
 
-    def __init__(self, n, gates, slice_bits=24, reps=32, verbose=True):
+    def __init__(self, n, gates, slice_bits=24, reps=32, verbose=True,
+                 fast=False, minimize="flops", probe=True):
         import cotengra as ctg
+        import sys as _sys
+        # cotengra's path search recurses deeply on a 2000+ tensor network;
+        # the default limit makes every trial die with RecursionError, which
+        # surfaces only as a useless "no tree" KeyError.
+        _sys.setrecursionlimit(20000)
         self.n, self.gates, self.ctg = n, gates, ctg
         # dummy bits: only the boundary *values* get overwritten later
         self.tn = build_tn(n, gates, "0" * n)
@@ -186,9 +192,17 @@ class ReusableOracle:
         self.inds = [list(map(str, t.inds)) for t in self.tensors]
         arrays = [t.data for t in self.tensors]
 
-        opt = (ctg.HyperOptimizer(max_repeats=reps, progbar=False,
-                                  slicing_opts={"target_size": 2 ** slice_bits})
-               if slice_bits else "greedy")
+        if slice_bits < 1:
+            raise ValueError("slice_bits must be >= 1 for a reusable tree")
+        slice_kw = {"target_size": 2 ** slice_bits}
+        # GreedyOptimizer in this version takes NO kwargs at all -- no
+        # minimize, and critically no slicing (hence the 4 TiB intermediate).
+        # Slicing lives on HyperOptimizer only.
+        opt = (ctg.GreedyOptimizer()
+               if fast else
+               ctg.HyperOptimizer(max_repeats=reps, progbar=False,
+                                  minimize=minimize, slicing_opts=slice_kw,
+                                  on_trial_error="ignore"))
         # cotengra wants (inputs, output, size_dict) -- NOT the arrays.  Passing
         # arrays where the einsum inputs belong makes every trial fail with
         # KeyError: 'tree'.  Every index here is a qubit wire, so size 2.
@@ -215,9 +229,23 @@ class ReusableOracle:
             self.cost = self.width = float("nan")
         self.sliced = tuple(str(i) for i in getattr(self.tree, "sliced_inds", ()))
         self.nslices = 2 ** len(self.sliced)
+        # contraction_cost() returns LINEAR flops, not log2 -- printing it raw
+        # reads as a nonsense "log2flops=2.7e30".  Width IS already log2.
+        self.log2cost = int(self.cost).bit_length() if self.cost == self.cost else 0
+        # Report the verdict BEFORE probing: the probe runs the real
+        # contraction, which can take arbitrarily long for a bad path.
+        if verbose:
+            print(f"[path] search {self.search_s:.1f}s "
+                  f"opt={'greedy-fast' if fast else 'hyper'} "
+                  f"2^{self.log2cost} flops log2width={self.width:.1f} "
+                  f"slices=2**{len(self.sliced)}", flush=True)
 
         # Probe which contraction call this cotengra build actually supports.
         self.mode, self._fn = None, None
+        if not probe:
+            if verbose:
+                print("[mode] probe skipped: stats only", flush=True)
+            return
         for name, fn in (
             ("tree.contract", lambda a: self.tree.contract(a)),
             ("ctg.array_contract", lambda a: ctg.array_contract(
@@ -234,9 +262,13 @@ class ReusableOracle:
         if self.mode is None:
             raise RuntimeError("no working contraction call for this cotengra")
         if verbose:
-            print(f"[path] search {self.search_s:.1f}s via {self.mode} "
-                  f"log2flops={self.cost:.1f} log2width={self.width:.1f} "
-                  f"slices=2**{len(self.sliced)}", flush=True)
+            # Calibrated threshold.  A search needs ~1e4 exact amplitudes.  At
+            # ~1e9 flops/s/core across 32 cores, 2^33 flops/amplitude is about
+            # an hour of wall clock for the whole search.  Beyond that, no.
+            verdict = ("SEARCHABLE" if self.log2cost < 33
+                       else "TOO EXPENSIVE to search with")
+            print(f"[mode] contraction via {self.mode}: "
+                  f"2^{self.log2cost} flops/amplitude => {verdict}", flush=True)
 
     def _vector(self, bit):
         v = np.zeros(2, dtype=complex)
@@ -245,6 +277,8 @@ class ReusableOracle:
 
     def amplitude(self, bits):
         """Exact <bits|U|0>, reusing the cached path."""
+        if self._fn is None:
+            raise RuntimeError("oracle built with probe=False: cannot evaluate")
         for q in range(self.n):
             self.tn[f"out{q}"].modify(data=self._vector(bits[q]))
         arrays = [t.data for t in self.tensors]
@@ -269,6 +303,11 @@ def main():
                     help="file of bitstrings, one per line (search mode)")
     ap.add_argument("--reps", type=int, default=32,
                     help="cotengra HyperOptimizer repeats")
+    ap.add_argument("--fast", action="store_true",
+                    help="greedy path instead of hyper-optimising (instant, worse)")
+    ap.add_argument("--no-probe", action="store_true",
+                    help="skip the probe contraction (stats only; avoids the "
+                         "4 TiB blow-up an unsliced greedy path produces)")
     args = ap.parse_args()
 
     n, gates, unmatched = parse_qasm(args.qasm)
@@ -287,7 +326,8 @@ def main():
                   "search returns a tree we can reuse")
             return
         rng = np.random.default_rng(args.seed)
-        oracle = ReusableOracle(n, gates, args.slice_bits, reps=args.reps)
+        oracle = ReusableOracle(n, gates, args.slice_bits, reps=args.reps,
+                                fast=args.fast, probe=not args.no_probe)
         strings = []
         if args.bits_file:
             strings += [l.strip() for l in open(args.bits_file) if l.strip()]
@@ -295,6 +335,9 @@ def main():
             strings.append(args.bits)
         for k in range(args.random if strings else max(args.random, 3)):
             strings.append("".join(rng.integers(0, 2, n).astype(str)))
+        if args.no_probe:
+            print("[eval] skipped (--no-probe): stats only", flush=True)
+            return
         print(f"[eval] {len(strings)} strings with the cached path", flush=True)
         best = (None, -1.0)
         t_all = time.time()

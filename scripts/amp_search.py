@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--truth", default=None, help="known answer, for Hamming check")
     ap.add_argument("--slice", type=int, default=24, dest="slice_bits")
     ap.add_argument("--reps", type=int, default=16)
+    ap.add_argument("--fast", action="store_true",
+                    help="use the instant greedy path instead of hyper-optimising")
     ap.add_argument("--p1f", type=float, default=0.75,
                     help="probability of a full 1-flip gradient step")
     ap.add_argument("--t-hi", type=float, default=3.0)
@@ -111,7 +113,8 @@ def main():
           f"{args.steps} steps each", flush=True)
 
     global _ORACLE, _N
-    _ORACLE = ReusableOracle(n, gates, args.slice_bits, reps=args.reps)
+    _ORACLE = ReusableOracle(n, gates, args.slice_bits, reps=args.reps,
+                             fast=args.fast)
     _N = n
 
     starts = []
