@@ -135,17 +135,19 @@ def _svd_full(M):
         return np.linalg.svd(M, full_matrices=False)
     except np.linalg.LinAlgError:
         import scipy.linalg as sla
-        try:
-            return sla.svd(M, full_matrices=False, lapack_driver="gesdd")
-        except Exception:
-            # Both drivers failing is almost always a non-finite input (an
-            # overflow upstream), NOT a LAPACK quirk.  Report which it is
-            # rather than leaving a misleading "SVD did not converge".
-            finite = bool(np.all(np.isfinite(M)))
-            mx = float(np.max(np.abs(M))) if M.size else 0.0
-            raise np.linalg.LinAlgError(
-                f"SVD failed on {M.shape}: all_finite={finite} "
-                f"max|M|={mx:.3e}")
+        # gesdd is fast but demonstrably fails to converge on well-scaled
+        # matrices here (observed: all_finite=True, max|M|=0.55, 512x512),
+        # so fall through to gesvd -- a different, QR-based algorithm that
+        # does not share gesdd's failure mode.
+        for drv in ("gesdd", "gesvd"):
+            try:
+                return sla.svd(M, full_matrices=False, lapack_driver=drv)
+            except Exception:
+                continue
+        finite = bool(np.all(np.isfinite(M)))
+        mx = float(np.max(np.abs(M))) if M.size else 0.0
+        raise np.linalg.LinAlgError(
+            f"SVD failed on {M.shape}: all_finite={finite} max|M|={mx:.3e}")
 
 
 def _svd_topk(M, kk):
